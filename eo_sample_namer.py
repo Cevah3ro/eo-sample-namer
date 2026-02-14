@@ -49,6 +49,44 @@ def load_audio(filepath, sr=22050, duration=None):
     return y, sr
 
 
+def compute_effective_duration(y, sr, threshold_db=-40):
+    """Compute effective duration — time until energy drops below threshold.
+    
+    This handles reverb tails: a kick with 4s of reverb is still a kick.
+    We find the last point where amplitude exceeds threshold relative to peak.
+    """
+    if len(y) == 0:
+        return 0.0
+    
+    # Compute RMS envelope in short frames
+    frame_length = min(512, len(y))
+    hop_length = frame_length // 4
+    
+    envelope = np.array([
+        np.sqrt(np.mean(y[i:i+frame_length]**2))
+        for i in range(0, len(y) - frame_length, hop_length)
+    ])
+    
+    if len(envelope) == 0:
+        return len(y) / sr
+    
+    peak_rms = np.max(envelope)
+    if peak_rms == 0:
+        return len(y) / sr
+    
+    # Threshold relative to peak
+    threshold_linear = peak_rms * (10 ** (threshold_db / 20))
+    
+    # Find last frame above threshold
+    above = np.where(envelope > threshold_linear)[0]
+    if len(above) == 0:
+        return len(y) / sr
+    
+    last_active_frame = above[-1]
+    effective_samples = (last_active_frame + 1) * hop_length + frame_length
+    return min(effective_samples / sr, len(y) / sr)
+
+
 def analyze_audio(filepath):
     """Full analysis of an audio file. Returns dict of features."""
     librosa = get_librosa()
@@ -59,34 +97,40 @@ def analyze_audio(filepath):
 
     analysis = {}
 
-    # Duration
+    # Duration (total and effective)
     duration = len(y) / sr
+    effective_duration = compute_effective_duration(y, sr)
     analysis["duration_sec"] = round(duration, 3)
-    analysis["duration_cat"] = classify_duration(duration)
+    analysis["effective_duration_sec"] = round(effective_duration, 3)
+    analysis["duration_cat"] = classify_duration(effective_duration)
+
+    # Use only the active portion for spectral analysis (up to effective duration + small margin)
+    active_samples = min(len(y), int((effective_duration + 0.05) * sr))
+    y_active = y[:active_samples]
 
     # RMS energy
-    rms = np.sqrt(np.mean(y**2))
+    rms = np.sqrt(np.mean(y_active**2))
     analysis["rms"] = round(float(rms), 4)
 
-    # Spectral features
-    spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
-    spectral_rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
-    spectral_bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
-    zero_crossings = np.mean(librosa.feature.zero_crossing_rate(y))
+    # Spectral features — computed on active portion only
+    spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y_active, sr=sr))
+    spectral_rolloff = np.mean(librosa.feature.spectral_rolloff(y=y_active, sr=sr))
+    spectral_bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y_active, sr=sr))
+    zero_crossings = np.mean(librosa.feature.zero_crossing_rate(y_active))
 
     analysis["spectral_centroid"] = round(float(spectral_centroid), 1)
     analysis["spectral_rolloff"] = round(float(spectral_rolloff), 1)
     analysis["spectral_bandwidth"] = round(float(spectral_bandwidth), 1)
     analysis["zero_crossing_rate"] = round(float(zero_crossings), 4)
 
-    # Onset strength (transient detection)
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    # Onset strength (transient detection) — use full signal for onset detection
+    onset_env = librosa.onset.onset_strength(y=y_active, sr=sr)
     analysis["onset_strength_mean"] = round(float(np.mean(onset_env)), 2)
     analysis["onset_strength_max"] = round(float(np.max(onset_env)), 2)
-    analysis["onset_count"] = int(len(librosa.onset.onset_detect(y=y, sr=sr, onset_envelope=onset_env)))
+    analysis["onset_count"] = int(len(librosa.onset.onset_detect(y=y_active, sr=sr, onset_envelope=onset_env)))
 
     # Envelope shape (attack/decay)
-    envelope = np.abs(y)
+    envelope = np.abs(y_active)
     # Smooth envelope with smaller kernel for transient detection
     kernel_size = min(256, len(envelope))
     if kernel_size > 0:
@@ -94,8 +138,8 @@ def analyze_audio(filepath):
         peak_idx = np.argmax(envelope_smooth)
         attack_time = peak_idx / sr
         analysis["attack_time"] = round(attack_time, 4)
-        # More generous percussive detection
-        analysis["is_percussive"] = attack_time < 0.05 and duration < 2.0
+        # Percussive detection: fast attack, any duration (reverb tails can be long)
+        analysis["is_percussive"] = attack_time < 0.1
     else:
         analysis["attack_time"] = 0
         analysis["is_percussive"] = False
@@ -103,8 +147,8 @@ def analyze_audio(filepath):
     # Noise ratio (high ZCR + low periodicity = noisy)
     analysis["noise_ratio"] = round(float(zcr_val := zero_crossings), 4)
 
-    # Harmonic-percussive separation
-    S = np.abs(librosa.stft(y))
+    # Harmonic-percussive separation — use active portion
+    S = np.abs(librosa.stft(y_active))
     H, P = librosa.decompose.hpss(S)
     harmonic_energy = np.sum(H**2)
     percussive_energy = np.sum(P**2)
@@ -159,7 +203,7 @@ def classify_duration(duration):
 
 def classify_type(a):
     """Classify sample type based on audio features."""
-    dur = a["duration_sec"]
+    dur = a.get("effective_duration_sec", a["duration_sec"])
     centroid = a["spectral_centroid"]
     attack = a["attack_time"]
     is_perc = a["is_percussive"]
@@ -169,14 +213,31 @@ def classify_type(a):
     perc_ratio = a.get("percussive_ratio", 0)
     harm_ratio = a.get("harmonic_ratio", 0)
 
-    # ─── FX detection first (noisy + slow attack = fx/riser/texture) ───
-    if zcr > 0.15 and attack > 0.1 and dur > 0.5:
+    # ─── Percussive detection: fast attack + high percussive ratio ───
+    # Real samples can have long reverb tails, so don't rely on duration alone.
+    # A sound is percussive if: fast attack OR high perc_ratio with reasonable attack
+    is_short_perc = (
+        (attack < 0.05 and perc_ratio > 0.4) or  # fast attack + percussive
+        (attack < 0.02 and dur < 2.0) or           # very fast attack, medium length
+        (is_perc and dur < 1.0)                     # original check for short sounds
+    )
+
+    # Also detect percussive sounds with moderate attack but long reverb tail
+    # These have very low harmonic ratio and fast initial transient
+    is_reverb_perc = (
+        attack < 0.1 and harm_ratio < 0.05 and perc_ratio > 0.9 and dur < 10.0
+    )
+
+    # ─── Clap detection (before FX): noisy, mid centroid, percussive energy ───
+    # Claps can have long reverb tails but are purely percussive with mid-high centroid
+    if perc_ratio > 0.9 and harm_ratio < 0.05 and 1500 < centroid < 6000 and 0.05 < zcr < 0.3:
+        return "clap"
+
+    # ─── FX detection: noisy + slow attack + not percussive ───
+    if zcr > 0.15 and attack > 0.1 and dur > 0.5 and not is_reverb_perc:
         return "fx"
 
-    # ─── Short percussive sounds (< 1s, fast attack) ───
-    is_short_perc = (is_perc or (perc_ratio > 0.4 and dur < 1.0)) and attack < 0.05 and dur < 1.0
-
-    if is_short_perc:
+    if is_short_perc or is_reverb_perc:
         # ─── HIHAT: very high centroid + very low harmonic content ───
         # Hihats are almost pure noise (harm<0.15) with very high centroid
         # OR extremely noisy (zcr>0.5) with high centroid
@@ -195,8 +256,11 @@ def classify_type(a):
         if harm_ratio < 0.1 and 2000 < centroid < 6000 and zcr > 0.15:
             return "clap"
 
-        # ─── SNARE: noise+tone mix, mid-high centroid ───
-        if 0.1 < harm_ratio < 0.6 and centroid > 1000 and zcr > 0.05:
+        # ─── SNARE: noise+tone mix, mid centroid (not as high as hihats) ───
+        if 0.1 < harm_ratio < 0.6 and 1000 < centroid < 5500 and zcr > 0.05:
+            return "snare"
+        # Snare variant: heavily processed snare (very low harm but mid centroid + moderate noise)
+        if harm_ratio < 0.1 and 1000 < centroid < 4000 and 0.05 < zcr < 0.3:
             return "snare"
 
         # ─── KICK: broader low centroid catch ───
