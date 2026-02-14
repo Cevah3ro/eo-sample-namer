@@ -177,24 +177,41 @@ def classify_type(a):
     is_short_perc = (is_perc or (perc_ratio > 0.4 and dur < 1.0)) and attack < 0.05 and dur < 1.0
 
     if is_short_perc:
-        # Kick: low frequency dominant
-        if centroid < 1500:
+        # ─── HIHAT: very high centroid + very low harmonic content ───
+        # Hihats are almost pure noise (harm<0.15) with very high centroid
+        # OR extremely noisy (zcr>0.5) with high centroid
+        if centroid > 5000 and harm_ratio < 0.15:
+            return "hihat"
+        if zcr > 0.5 and centroid > 3000 and harm_ratio < 0.3:
+            return "hihat"
+
+        # ─── KICK: low centroid, sub-heavy ───
+        if centroid < 500 and harm_ratio > 0.2:
             return "kick"
-        # Hihat vs Snare vs Clap: higher centroid
-        elif centroid > 800:
-            if zcr > 0.2 and harm_ratio < 0.3:
-                # Very noisy + low harmonic content = hihat
-                return "hihat"
-            elif harm_ratio < 0.05:
-                # Fully percussive, no tone = clap
-                return "clap"
-            elif zcr > 0.05:
-                # Some noise + some tone = snare
-                return "snare"
-            else:
-                return "perc"
-        else:
+        if centroid < 300:
+            return "kick"
+
+        # ─── CLAP: mid-high centroid, very noisy (harm<0.1), bandpassed feel ───
+        if harm_ratio < 0.1 and 2000 < centroid < 6000 and zcr > 0.15:
+            return "clap"
+
+        # ─── SNARE: noise+tone mix, mid-high centroid ───
+        if 0.1 < harm_ratio < 0.6 and centroid > 1000 and zcr > 0.05:
+            return "snare"
+
+        # ─── KICK: broader low centroid catch ───
+        if centroid < 1500 and harm_ratio > 0.3:
+            return "kick"
+
+        # ─── Tonal percussion (congas, toms, etc): harmonic, mid centroid ───
+        if harm_ratio > 0.3 and centroid > 150:
             return "perc"
+
+        # ─── Remaining noisy short sounds ───
+        if centroid > 3000 and harm_ratio < 0.3:
+            return "hihat"
+
+        return "perc"
 
     # ─── Loops (many onsets + percussive + long) ───
     if dur > 2.0 and onset_count >= 6 and perc_ratio > 0.5:
