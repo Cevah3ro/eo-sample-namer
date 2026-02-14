@@ -228,9 +228,9 @@ def classify_type(a):
         attack < 0.1 and harm_ratio < 0.05 and perc_ratio > 0.9 and dur < 10.0
     )
 
-    # ─── Clap detection (before FX): noisy, mid centroid, percussive energy ───
-    # Claps can have long reverb tails but are purely percussive with mid-high centroid
-    if perc_ratio > 0.9 and harm_ratio < 0.05 and 1500 < centroid < 6000 and 0.05 < zcr < 0.3:
+    # ─── Clap detection (before FX): noisy, mid-high centroid, percussive energy ───
+    # Claps: purely percussive, mid-high centroid, moderate zcr (not as high as hihats)
+    if perc_ratio > 0.9 and harm_ratio < 0.05 and 2000 < centroid < 5000 and 0.12 < zcr < 0.4:
         return "clap"
 
     # ─── FX detection: noisy + slow attack + not percussive ───
